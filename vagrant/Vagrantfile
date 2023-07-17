@@ -1,0 +1,112 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+ENV['VAGRANT_NO_PARALLEL'] = 'yes'
+
+git = 'raw.githubusercontent.com/having-dlrow/iac/main/vagrant/manifest'
+domain = 'example.com'
+
+k8s_version = '1.26.6-00'                           # Kubernetes 
+docker_version = '5:24.0.2-1~ubuntu.22.04~jammy'    # Docker  
+ctrd_version = '1.6.12-0ubuntu1~22.04.1'            # Containerd
+
+pod_network_cidr = "10.244.0.0/16"
+pod_network_type = "calico"             # choose between calico and flannel
+
+subnet = '192.168.30'   #subnet
+master_ip = "#{subnet}.100"
+
+dashboard_port=443
+
+worker_count = 2
+Vagrant.configure(2) do |config|
+
+  # boot timeout 10m
+  config.vm.boot_timeout = 600
+
+  # basic image
+  config.vm.provision "shell", path: "bootstrap.sh",  env: {"DOCKER_VERSION" =>docker_version , "MASTER" =>master_ip, "NODE" =>worker_count, "VERSION" => k8s_version}
+  config.vm.provision "shell", path: "kubernetes.sh", env: {"VERSION" => k8s_version}
+
+  # Kubernetes Master Node
+  config.vm.define "k8s-master" , primary: true do |master|
+    master.vm.box = "ubuntu/jammy64"
+    master.vm.box_version  = "20230616.0.0"
+
+    master.vm.hostname = "k8s-master.#{domain}"
+    
+    # ip
+    master.vm.network "private_network", ip: "#{master_ip}"
+
+    # port
+    master.vm.network "forwarded_port", guest: 22, host: 60200, auto_correct: true, id: "ssh"
+
+    # /etc/hosts
+    master.vm.provision "shell", env: {"DOMAIN" => domain, "MASTER" => master_ip} ,inline: <<-SHELL 
+    echo "$MASTER k8s-master.$DOMAIN k8s-master" >> /etc/hosts 
+    SHELL
+    (1..worker_count).each do |i|
+      master.vm.provision "shell", env: {"DOMAIN" => domain, "NODE_INDEX" => i, "SUBNET" => subnet}, inline: <<-SHELL 
+      echo "$SUBNET.10$NODE_INDEX k8s-worker-$NODE_INDEX.$DOMAIN k8s-worker-$NODE_INDEX" >> /etc/hosts 
+      SHELL
+    end
+
+    master.vm.provider "virtualbox" do |v|
+      v.name = "k8s-master"
+      v.memory = 4096
+      v.cpus = 4
+      v.customize ["modifyvm", :id, "--groups", "/kubernetes"]
+      # v.customize ["modifyvm", :id, "--nic1", "nat"]
+    end
+
+    master.vm.provision "shell", path: "kubernetes_master.sh", env: {"VERSION" => k8s_version , "MASTER" => master_ip, "K8S_POD_NETWORK_CIDR" => pod_network_cidr, "K8S_POD_NETWORK_TYPE" => pod_network_type, "GIT" => git}
+
+  end
+
+  # Kubernetes Worker Nodes
+  (1..worker_count).each do |index|
+    config.vm.define "k8s-worker-#{index}" do |worker|
+      worker.vm.box = "ubuntu/jammy64"
+      worker.vm.box_version  = "20230616.0.0"
+
+      worker.vm.hostname = "k8s-worker-#{index}.#{domain}"
+
+      # ip
+      worker.vm.network "private_network", ip: "#{subnet}.10#{index}"
+
+      # port
+      worker.vm.network "forwarded_port", guest: 22, host: "6020#{index}", auto_correct: true, id: "ssh"
+
+      # /etc/hosts
+      worker.vm.provision "shell", env: {"DOMAIN" => domain, "MASTER" => master_ip} ,inline: <<-SHELL 
+      echo "$MASTER k8s-master.$DOMAIN k8s-master" >> /etc/hosts 
+      SHELL
+      (1..worker_count).each do |ind|
+        worker.vm.provision "shell", env: {"DOMAIN" => domain, "NODE_INDEX" => ind, "SUBNET" => subnet}, inline: <<-SHELL 
+        echo "$SUBNET.10$NODE_INDEX k8s-worker-$NODE_INDEX.$DOMAIN k8s-worker-$NODE_INDEX" >> /etc/hosts 
+        SHELL
+      end
+
+      worker.vm.provider "virtualbox" do |v|
+        v.name = "k8s-worker-#{index}"
+        v.memory = 2048
+        v.cpus = 2
+        v.customize ["modifyvm", :id, "--groups", "/kubernetes"]
+        # v.customize ["modifyvm", :id, "--nic1", "nat"]
+      end
+
+      worker.vm.provision  "shell", path: "kubernetes_worker.sh", env: {"VERSION" => k8s_version , "MASTER" => master_ip}
+      
+      # if index == worker_count
+      #   # dashboard
+      #   worker.vm.provision  "shell", path: "./service/dashboard.sh"
+
+      #   # nfs storage
+      #   worker.vm.provision  "shell", path: "./storage/nfs.sh"
+      #   worker.vm.provision  "shell", path: "./storage/dynamic-provision.sh"
+
+      # end
+    end
+  end
+
+end
